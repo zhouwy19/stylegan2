@@ -1,0 +1,1 @@
+python fid.py --inception ./inception_ffhq.pkl ./checkpoint/000000.pt
