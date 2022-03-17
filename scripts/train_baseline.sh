@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 --master_port=1236 train.py --iter 5000 --batch 8 --output_path=/mnt/disk2/zwy/nas/stylegan2.results/baseline /mnt/disk2/zwy/nas/FFHQ-All

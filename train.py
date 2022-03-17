@@ -11,6 +11,8 @@ from torch.utils import data
 import torch.distributed as dist
 from torchvision import transforms, utils
 from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import json
 
 try:
     import wandb
@@ -123,7 +125,7 @@ def set_grad_none(model, targets):
             p.grad = None
 
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, writer=None):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -302,13 +304,21 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
+            if i % 10 == 0:
+                writer.add_scalar('train/d_loss_val', d_loss_val, i)
+                writer.add_scalar('train/g_loss_val', g_loss_val, i)
+                writer.add_scalar('train/r1_val', r1_val, i)
+                writer.add_scalar('train/path_loss_val', path_loss_val, i)
+                writer.add_scalar('train/mean_path_length_avg', mean_path_length_avg, i)
+                writer.add_scalar('train/ada_aug_p', ada_aug_p, i)
+
             if i % 100 == 0:
                 with torch.no_grad():
                     g_ema.eval()
                     sample, _ = g_ema([sample_z])
                     utils.save_image(
                         sample,
-                        f"sample/{str(i).zfill(6)}.png",
+                        f"{args.output_path}/sample/{str(i).zfill(6)}.png",
                         nrow=int(args.n_sample ** 0.5),
                         normalize=True,
                         range=(-1, 1),
@@ -325,7 +335,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         "args": args,
                         "ada_aug_p": ada_aug_p,
                     },
-                    f"checkpoint/{str(i).zfill(6)}.pt",
+                    f"{args.output_path}/checkpoint/{str(i).zfill(6)}.pt",
                 )
 
 
@@ -336,6 +346,7 @@ if __name__ == "__main__":
 
     parser.add_argument("path", type=str, help="path to the lmdb dataset")
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
+    parser.add_argument('--output_path', type=str, default='./')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
     )
@@ -429,6 +440,12 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    os.makedirs(f"{args.output_path}/sample/", exist_ok=True)
+    os.makedirs(f"{args.output_path}/checkpoint/", exist_ok=True)
+    writer = SummaryWriter(args.output_path)
+    with open(f"{args.output_path}/config.txt", 'w') as f:
+        json.dump(args.__dict__, f, indent=2)
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
@@ -528,4 +545,4 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, writer)
