@@ -104,7 +104,6 @@ class Blur(nn.Module):
             kernel = kernel * (upsample_factor ** 2)
 
         self.register_buffer("kernel", kernel)
-
         self.pad = pad
 
     def forward(self, input):
@@ -112,20 +111,25 @@ class Blur(nn.Module):
 
         return out
 
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}({self.pad})"
+        )
 
 class EqualConv2d(nn.Module):
     def __init__(
-        self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True
+        self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True, groups=1
     ):
         super().__init__()
 
         self.weight = nn.Parameter(
-            torch.randn(out_channel, in_channel, kernel_size, kernel_size)
+            torch.randn(out_channel, in_channel // groups, kernel_size, kernel_size)
         )
         self.scale = 1 / math.sqrt(in_channel * kernel_size ** 2)
 
         self.stride = stride
         self.padding = padding
+        self.groups = groups
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channel))
@@ -140,14 +144,15 @@ class EqualConv2d(nn.Module):
             bias=self.bias,
             stride=self.stride,
             padding=self.padding,
+            groups=self.groups
         )
 
         return out
 
     def __repr__(self):
         return (
-            f"{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]},"
-            f" {self.weight.shape[2]}, stride={self.stride}, padding={self.padding})"
+            f"{self.__class__.__name__}({self.weight.shape[1] * self.groups}, {self.weight.shape[0]},"
+            f" {self.weight.shape[2]}, stride={self.stride}, padding={self.padding}, groups={self.groups})"
         )
 
 
@@ -200,6 +205,7 @@ class ModulatedConv2d(nn.Module):
         downsample=False,
         blur_kernel=[1, 3, 3, 1],
         fused=True,
+        groups=1
     ):
         super().__init__()
 
@@ -209,6 +215,7 @@ class ModulatedConv2d(nn.Module):
         self.out_channel = out_channel
         self.upsample = upsample
         self.downsample = downsample
+        self.groups = groups
 
         if upsample:
             factor = 2
@@ -231,10 +238,10 @@ class ModulatedConv2d(nn.Module):
         self.padding = kernel_size // 2
 
         self.weight = nn.Parameter(
-            torch.randn(1, out_channel, in_channel, kernel_size, kernel_size)
+            torch.randn(1, out_channel, in_channel // groups, kernel_size, kernel_size)
         )
 
-        self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
+        self.modulation = EqualLinear(style_dim, in_channel // groups, bias_init=1)
 
         # self.attn = AttentionModule(in_channel, in_channel)
 
@@ -279,7 +286,7 @@ class ModulatedConv2d(nn.Module):
 
             return out
 
-        style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
+        style = self.modulation(style).view(batch, 1, in_channel // self.groups, 1, 1)
         weight = self.scale * self.weight * style
 
         if self.demodulate:
@@ -287,7 +294,7 @@ class ModulatedConv2d(nn.Module):
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
 
         weight = weight.view(
-            batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
+            batch * self.out_channel, in_channel // self.groups, self.kernel_size, self.kernel_size
         )
 
         if self.upsample:
@@ -310,7 +317,7 @@ class ModulatedConv2d(nn.Module):
             _, _, height, width = input.shape
             input = input.view(1, batch * in_channel, height, width)
             out = conv2d_gradfix.conv2d(
-                input, weight, padding=0, stride=2, groups=batch
+                input, weight, padding=0, stride=2, groups=batch * self.groups
             )
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
@@ -319,7 +326,7 @@ class ModulatedConv2d(nn.Module):
             # input = self.attn(input)
             input = input.view(1, batch * in_channel, height, width)
             out = conv2d_gradfix.conv2d(
-                input, weight, padding=self.padding, groups=batch
+                input, weight, padding=self.padding, groups=batch * self.groups
             )
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
@@ -367,15 +374,64 @@ class StyledConv(nn.Module):
     ):
         super().__init__()
 
-        self.conv = ModulatedConv2d(
-            in_channel,
-            out_channel,
-            kernel_size,
-            style_dim,
-            upsample=upsample,
-            blur_kernel=blur_kernel,
-            demodulate=demodulate,
-        )
+        # self.conv = nn.Sequential(
+        #     ModulatedConv2d(
+        #         in_channel,
+        #         in_channel,
+        #         kernel_size,
+        #         style_dim,
+        #         upsample=upsample,
+        #         blur_kernel=blur_kernel,
+        #         demodulate=demodulate,
+        #     ),
+        #     ModulatedConv2d(
+        #         in_channel,
+        #         out_channel,
+        #         1,
+        #         style_dim,
+        #         upsample=False,
+        #         blur_kernel=blur_kernel,
+        #         demodulate=demodulate,
+        #     )
+        # )
+
+        self.upsample = upsample
+
+        if upsample:
+            self.conv = ModulatedConv2d(
+                in_channel,
+                out_channel,
+                kernel_size,
+                style_dim,
+                upsample=upsample,
+                blur_kernel=blur_kernel,
+                demodulate=demodulate,
+            )
+        else:
+            self.conv = nn.Sequential(
+                ModulatedConv2d(
+                    in_channel,
+                    in_channel,
+                    kernel_size,
+                    style_dim,
+                    upsample=upsample,
+                    blur_kernel=blur_kernel,
+                    demodulate=demodulate,
+                    groups=in_channel
+                ),
+                nn.BatchNorm2d(in_channel, affine=False),
+                ModulatedConv2d(
+                    in_channel,
+                    out_channel,
+                    1,
+                    style_dim,
+                    upsample=upsample,
+                    blur_kernel=blur_kernel,
+                    demodulate=demodulate
+                ),
+                nn.BatchNorm2d(out_channel, affine=False)
+            )
+            
 
         self.noise = NoiseInjection()
         # self.bias = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
@@ -383,7 +439,14 @@ class StyledConv(nn.Module):
         self.activate = FusedLeakyReLU(out_channel)
 
     def forward(self, input, style, noise=None):
-        out = self.conv(input, style)
+        if self.upsample:
+            out = self.conv(input, style)
+        else:
+            out = self.conv[0](input, style)
+            out = self.conv[1](out)
+            out = self.conv[2](out, style)
+            out = self.conv[3](out)
+
         out = self.noise(out, noise=noise)
         # out = out + self.bias
         out = self.activate(out)
@@ -454,7 +517,7 @@ class Generator(nn.Module):
 
         self.input = ConstantInput(self.channels[4])
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 21, style_dim, blur_kernel=blur_kernel
         )
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
@@ -489,7 +552,7 @@ class Generator(nn.Module):
 
             self.convs.append(
                 StyledConv(
-                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
+                    out_channel, out_channel, 21, style_dim, blur_kernel=blur_kernel
                 )
             )
 
@@ -610,29 +673,66 @@ class ConvLayer(nn.Sequential):
 
         if downsample:
             factor = 2
-            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            p = (len(blur_kernel) - factor) # + (kernel_size - 1)
             pad0 = (p + 1) // 2
             pad1 = p // 2
 
             layers.append(Blur(blur_kernel, pad=(pad0, pad1)))
 
             stride = 2
-            self.padding = 0
+            self.padding = kernel_size // 2
 
         else:
             stride = 1
             self.padding = kernel_size // 2
 
-        layers.append(
-            EqualConv2d(
-                in_channel,
-                out_channel,
-                kernel_size,
-                padding=self.padding,
-                stride=stride,
-                bias=bias and not activate,
-            )
+
+        conv1 = nn.Conv2d(
+            in_channel,
+            in_channel,
+            kernel_size,
+            padding=self.padding,
+            stride=stride,
+            bias=bias and not activate,
+            groups=in_channel
         )
+        # nn.init.xavier_uniform(conv1.weight)
+        layers.append(conv1)
+        layers.append(nn.BatchNorm2d(in_channel, affine=False))
+    
+        conv2 = nn.Conv2d(
+            in_channel,
+            out_channel,
+            1,
+            padding=0,
+            stride=1,
+            bias=bias and not activate,
+        )
+        nn.init.xavier_uniform(conv2.weight)
+        layers.append(conv2)
+        layers.append(nn.BatchNorm2d(out_channel, affine=False))
+    
+        # layers.append(
+        #     EqualConv2d(
+        #         in_channel,
+        #         out_channel,
+        #         1,
+        #         padding=0,
+        #         stride=1,
+        #         bias=bias and not activate,
+        #     )
+        # )
+
+        # layers.append(
+        #     EqualConv2d(
+        #         in_channel,
+        #         out_channel,
+        #         1,
+        #         padding=0,
+        #         stride=1,
+        #         bias=bias and not activate,
+        #     )
+        # )
 
         # if stride == 1:
         #     layers.append(
@@ -663,20 +763,49 @@ class ResBlock(nn.Module):
     def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
         super().__init__()
 
-        self.conv1 = ConvLayer(in_channel, in_channel, 3)
-        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
+        self.conv1 = ConvLayer(in_channel, in_channel, 21)
+        self.conv2 = ConvLayer(in_channel, out_channel, 21, downsample=True)
 
         self.skip = ConvLayer(
-            in_channel, out_channel, 1, downsample=True, activate=False, bias=False
+            in_channel, out_channel, 21, downsample=True, activate=False, bias=False
         )
 
     def forward(self, input):
+        # print("input: ", input.max(), input.min())
+        a = self.conv1[0](input)
+        # print(a.max(), a.min())
+        a = self.conv1[1](a)
+        # print(a.max(), a.min())
+        a = self.conv2[0](a)
+        # print(a.max(), a.min())
+        a = self.conv2[1](a)
+        # print(a.max(), a.min())
+        a = self.conv2[3](a)
+        # print(a.max(), a.min())
+        a = self.conv1[0].weight
+        # print(a.max(), a.min())
+        a = self.conv1[2].weight
+        # print(a.max(), a.min())
+        a = self.conv2[1].weight
+        # print(a.max(), a.min())
+        a = self.conv2[3].weight
+        # print(a.max(), a.min())
+        # import pdb
+        # pdb.set_trace()
+        # print("-" * 30)
+        # print("input: ", input.max(), input.min())
         out = self.conv1(input)
+        # # print(out.max(), out.min())
         out = self.conv2(out)
+        # # print(out.max(), out.min())
 
         skip = self.skip(input)
+        # import pdb
+        # pdb.set_trace()
         out = (out + skip) / math.sqrt(2)
 
+        # print("skip: ", skip.max(), skip.min())
+        # print("out: ", out.max(), out.min())
         return out
 
 
@@ -696,7 +825,7 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        convs = [ConvLayer(3, channels[size], 1)]
+        convs = [ConvLayer(3, channels[size], 21)]
 
         log_size = int(math.log(size, 2))
 
@@ -714,14 +843,17 @@ class Discriminator(nn.Module):
         self.stddev_group = 4
         self.stddev_feat = 1
 
-        self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
+        self.final_conv = ConvLayer(in_channel + 1, channels[4], 21)
         self.final_linear = nn.Sequential(
             EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
             EqualLinear(channels[4], 1),
         )
 
     def forward(self, input):
+        # import pdb
+        # pdb.set_trace()
         out = self.convs(input)
+        # print(out.max(), out.min())
 
         batch, channel, height, width = out.shape
         group = min(batch, self.stddev_group)
@@ -733,10 +865,12 @@ class Discriminator(nn.Module):
         stddev = stddev.repeat(group, 1, height, width)
         out = torch.cat([out, stddev], 1)
 
+        # print(out.max(), out.min())
+
         out = self.final_conv(out)
 
         out = out.view(batch, -1)
+        # print(out.max(), out.min())
         out = self.final_linear(out)
 
         return out
-
